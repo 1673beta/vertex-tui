@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"iter"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -210,3 +212,81 @@ func TestAgentToolCallingLoop(t *testing.T) {
 		t.Fatalf("missing expected events: toolCall=%v toolResult=%v finalText=%v", sawToolCall, sawToolResult, sawFinalText)
 	}
 }
+
+type roundTripFunc func(req *http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestFetchModelGardenModelsREST(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1beta1/publishers/google/models":
+			_, _ = w.Write([]byte(`{
+				"publisherModels": [
+					{
+						"name": "publishers/google/models/gemini-2.5-pro-preview-06-05",
+						"versionId": "001",
+						"launchStage": "PUBLIC_PREVIEW"
+					},
+					{
+						"name": "publishers/google/models/resnet-50",
+						"versionId": "001",
+						"launchStage": "GA"
+					}
+				]
+			}`))
+		case "/v1beta1/publishers/anthropic/models":
+			_, _ = w.Write([]byte(`{
+				"publisherModels": [
+					{
+						"name": "publishers/anthropic/models/claude-3-7-sonnet@20250219",
+						"versionId": "20250219",
+						"launchStage": "GA"
+					}
+				]
+			}`))
+		default:
+			_, _ = w.Write([]byte(`{"publisherModels": []}`))
+		}
+	})
+
+	vb := &VertexBackend{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				return rec.Result(), nil
+			}),
+		},
+		baseURL:    "https://us-central1-aiplatform.googleapis.com",
+		apiVersion: "v1beta1",
+	}
+
+	// Default filter: only generative / coding LLMs (excludes resnet-50)
+	models, err := vb.FetchModelGardenModels(context.Background(), ModelGardenListOptions{
+		Publishers: []string{"google", "anthropic"},
+		IncludeAll: false,
+	})
+	if err != nil {
+		t.Fatalf("FetchModelGardenModels failed: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("expected 2 generative LLM models from Model Garden, got %d: %+v", len(models), models)
+	}
+
+	// IncludeAll: true -> includes resnet-50 as well
+	allModels, err := vb.FetchModelGardenModels(context.Background(), ModelGardenListOptions{
+		Publishers: []string{"google", "anthropic"},
+		IncludeAll: true,
+	})
+	if err != nil {
+		t.Fatalf("FetchModelGardenModels(IncludeAll) failed: %v", err)
+	}
+	if len(allModels) != 3 {
+		t.Fatalf("expected 3 total models from Model Garden with IncludeAll=true, got %d", len(allModels))
+	}
+}
+

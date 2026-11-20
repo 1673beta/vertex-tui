@@ -36,7 +36,7 @@ type ChatMessage struct {
 	Timestamp time.Time
 }
 
-// Bubble Tea messages for async streaming from the Vertex AI agent.
+// Bubble Tea messages for async streaming from the Vertex AI agent and Model Garden discovery.
 type (
 	agentStreamEventMsg struct {
 		event agent.StreamEvent
@@ -48,6 +48,7 @@ type (
 	modelsRefreshedMsg struct {
 		models []config.ModelInfo
 		err    error
+		silent bool
 	}
 )
 
@@ -72,17 +73,18 @@ type App struct {
 	lastTokensOut int32
 
 	// Text input editor state (Unicode rune-safe)
-	inputRunes  []rune
-	cursorPos   int
-	inputHist   []string
-	histIdx     int
-	suggestIdx  int
+	inputRunes []rune
+	cursorPos  int
+	inputHist  []string
+	histIdx    int
+	suggestIdx int
 
 	// Interactive /model modal state
 	showModelModal   bool
 	modelFilterRunes []rune
 	selectedModelIdx int
 	refreshingModels bool
+	includeAllGarden bool
 }
 
 // NewApp creates a new Vertex AI Coding Agent TUI application.
@@ -119,7 +121,8 @@ func NewApp(ctx context.Context, ag *agent.Agent) *App {
 			"  • 現在のモデル (Active Model): %s (%s)\n"+
 			"  • Project / Location: %s / %s\n"+
 			"  • Workspace: %s\n"+
-			"  • モデル変更: `/model` で対話型セレクタを開くか、`/model <モデル名>` (例: `/model gemini-2.5-flash`) を入力してください。\n"+
+			"  • モデル変更: `/model` で Model Garden 対応の対話型セレクタを開くか、`/model <モデル名>` を入力してください。\n"+
+			"  • Model Garden 取得: 起動時および `/model` 表示時に Vertex AI Model Garden (`publishers/*/models`) から自動取得します (`/model garden [publisher]` も利用可)。\n"+
 			"  • ヘルプ表示: `/help` | ショートカット: `Ctrl+O` でモデル選択画面を表示",
 		modelInfo.ID,
 		modelInfo.DisplayName,
@@ -139,9 +142,13 @@ func NewApp(ctx context.Context, ag *agent.Agent) *App {
 	return app
 }
 
-// Init initializes the Bubble Tea program.
+// Init initializes the Bubble Tea program and triggers an asynchronous Vertex AI Model Garden fetch.
 func (a *App) Init() tea.Cmd {
-	return a.spinner.Tick
+	a.refreshingModels = true
+	return tea.Batch(
+		a.spinner.Tick,
+		a.refreshModelGardenCmd(agent.ModelGardenListOptions{}, true),
+	)
 }
 
 // Update handles Bubble Tea messages (key presses, window resize, streaming agent events).
@@ -178,9 +185,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case modelsRefreshedMsg:
 		a.refreshingModels = false
 		if msg.err != nil {
-			a.appendMessage(RoleError, "Model Refresh", fmt.Sprintf("Vertex AIからのモデル一覧取得に失敗しました: %v", msg.err))
+			if !msg.silent {
+				a.appendMessage(RoleError, "Model Garden", fmt.Sprintf("Vertex AI Model Garden からのモデル一覧取得に失敗しました: %v", msg.err))
+			}
 		} else {
-			a.appendMessage(RoleSystem, "Model Refresh", fmt.Sprintf("Vertex AIモデル一覧を更新しました (合計 %d モデル)。", len(msg.models)))
+			if !msg.silent {
+				a.appendMessage(RoleSystem, "Model Garden", fmt.Sprintf("Vertex AI Model Garden からモデル一覧を取得・更新しました (合計 %d モデル)。", len(msg.models)))
+			}
 			a.syncSelectedModelIndex()
 		}
 		a.refreshViewportContent(true)
@@ -207,11 +218,7 @@ func (a *App) handleModelModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	filtered := a.filteredModalModels()
 
 	switch msg.Type {
-	case tea.KeyCtrlC:
-		a.showModelModal = false
-		return a, nil
-
-	case tea.KeyEsc:
+	case tea.KeyCtrlC, tea.KeyEsc:
 		a.showModelModal = false
 		return a, nil
 
@@ -232,7 +239,12 @@ func (a *App) handleModelModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyCtrlR:
 		a.refreshingModels = true
-		return a, a.refreshModelsCmd()
+		return a, a.refreshModelGardenCmd(agent.ModelGardenListOptions{IncludeAll: a.includeAllGarden}, false)
+
+	case tea.KeyCtrlA:
+		a.includeAllGarden = !a.includeAllGarden
+		a.refreshingModels = true
+		return a, a.refreshModelGardenCmd(agent.ModelGardenListOptions{IncludeAll: a.includeAllGarden}, false)
 
 	case tea.KeyEnter:
 		filterText := strings.TrimSpace(string(a.modelFilterRunes))
@@ -298,8 +310,7 @@ func (a *App) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyCtrlO, tea.KeyF2:
-		a.openModelModal()
-		return a, nil
+		return a, a.openModelModalCmd()
 
 	case tea.KeyCtrlL:
 		a.messages = nil
@@ -420,7 +431,6 @@ func (a *App) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) insertRunes(r []rune) {
-	// Sanitize newlines from single-line input paste
 	clean := make([]rune, 0, len(r))
 	for _, ch := range r {
 		if ch == '\r' || ch == '\n' {
@@ -443,7 +453,6 @@ func (a *App) setInput(s string) {
 	a.suggestIdx = 0
 }
 
-// handleSubmittedInput processes slash commands (like `/model`) or sends a prompt to Vertex AI.
 func (a *App) handleSubmittedInput(raw string) (tea.Model, tea.Cmd) {
 	if strings.HasPrefix(raw, "/") {
 		return a.executeSlashCommand(raw)
@@ -479,10 +488,11 @@ func (a *App) executeSlashCommand(raw string) (tea.Model, tea.Cmd) {
 		err := a.agent.SetProject(a.ctx, arg)
 		if err != nil {
 			a.appendMessage(RoleSystem, "Project", fmt.Sprintf("Project を %q に設定しました (クライアント接続状態: %v)", arg, err))
-		} else {
-			a.appendMessage(RoleSystem, "Project", fmt.Sprintf("Google Cloud Project を %q に変更し、Vertex AI クライアントを再接続しました。", arg))
+			return a, nil
 		}
-		return a, nil
+		a.appendMessage(RoleSystem, "Project", fmt.Sprintf("Google Cloud Project を %q に変更し、Vertex AI クライアントを再接続しました。Model Garden からモデル一覧を取得します...", arg))
+		a.refreshingModels = true
+		return a, a.refreshModelGardenCmd(agent.ModelGardenListOptions{IncludeAll: a.includeAllGarden}, true)
 
 	case "/location", "/region":
 		if arg == "" {
@@ -493,10 +503,11 @@ func (a *App) executeSlashCommand(raw string) (tea.Model, tea.Cmd) {
 		err := a.agent.SetLocation(a.ctx, arg)
 		if err != nil {
 			a.appendMessage(RoleSystem, "Location", fmt.Sprintf("Location を %q に設定しました (クライアント接続状態: %v)", arg, err))
-		} else {
-			a.appendMessage(RoleSystem, "Location", fmt.Sprintf("Vertex AI Location を %q に変更し、クライアントを再接続しました。", arg))
+			return a, nil
 		}
-		return a, nil
+		a.appendMessage(RoleSystem, "Location", fmt.Sprintf("Vertex AI Location を %q に変更し、クライアントを再接続しました。Model Garden からモデル一覧を取得します...", arg))
+		a.refreshingModels = true
+		return a, a.refreshModelGardenCmd(agent.ModelGardenListOptions{IncludeAll: a.includeAllGarden}, true)
 
 	case "/tools":
 		var sb strings.Builder
@@ -518,17 +529,25 @@ func (a *App) executeSlashCommand(raw string) (tea.Model, tea.Cmd) {
 				connStatus = "Disconnected"
 			}
 		}
+		gardenStatus := "未同期 (オフラインキャッシュ / `/model refresh` で取得)"
+		if a.agent.IsModelGardenSynced() {
+			gardenStatus = fmt.Sprintf("同期済み (%d models loaded from Vertex AI Model Garden)", len(a.agent.AvailableModels()))
+		}
 		statusText := fmt.Sprintf(
 			"Vertex AI Agent Status:\n"+
-				"  • Model       : %s (%s)\n"+
-				"  • Provider    : %s\n"+
-				"  • Project     : %s\n"+
-				"  • Location    : %s\n"+
-				"  • Backend     : %s\n"+
-				"  • Workspace   : %s\n"+
-				"  • History     : %d turns",
+				"  • Model         : %s (%s)\n"+
+				"  • Resource      : %s\n"+
+				"  • Provider      : %s\n"+
+				"  • Model Garden  : %s\n"+
+				"  • Project       : %s\n"+
+				"  • Location      : %s\n"+
+				"  • Backend       : %s\n"+
+				"  • Workspace     : %s\n"+
+				"  • History       : %d turns",
 			m.ID, m.DisplayName,
+			emptyFallback(m.ResourceName, "publishers/google/models/"+m.ID),
 			m.Provider,
+			gardenStatus,
 			emptyFallback(cfg.Project, "(unset)"),
 			cfg.Location,
 			connStatus,
@@ -548,12 +567,19 @@ func (a *App) executeSlashCommand(raw string) (tea.Model, tea.Cmd) {
 		var sb strings.Builder
 		sb.WriteString("利用可能なスラッシュコマンド (Slash Commands):\n")
 		for _, s := range SlashCommands() {
-			fmt.Fprintf(&sb, "  • %-42s : %s\n", s.Usage, s.Description)
+			fmt.Fprintf(&sb, "  • %-54s : %s\n", s.Usage, s.Description)
 		}
+		sb.WriteString("\nModel Garden コマンド例:\n")
+		sb.WriteString("  • /model                     : Model Garden 対応の対話型モデル選択画面を開く\n")
+		sb.WriteString("  • /model garden              : Vertex AI Model Garden (google, anthropic, meta, mistralai, deepseek-ai 等) から最新一覧を取得\n")
+		sb.WriteString("  • /model garden anthropic    : 指定パブリッシャー (publishers/anthropic/models) のモデルを Model Garden から取得\n")
+		sb.WriteString("  • /model garden all          : 非LLMモデルも含めて Model Garden の全モデルを取得\n")
 		sb.WriteString("\nキーボードショートカット:\n")
 		sb.WriteString("  • Enter       : メッセージ送信 / コマンド実行\n")
 		sb.WriteString("  • Tab         : スラッシュコマンド・モデル名の自動補完\n")
 		sb.WriteString("  • Ctrl+O / F2 : `/model` モデル選択モーダルを開く\n")
+		sb.WriteString("  • Ctrl+R      : (モデル選択画面内) Vertex AI Model Garden から再取得\n")
+		sb.WriteString("  • Ctrl+A      : (モデル選択画面内) 生成AIモデルのみ / Model Garden 全モデル表示の切替\n")
 		sb.WriteString("  • Esc         : 生成のキャンセル / モーダルを閉じる\n")
 		sb.WriteString("  • PgUp / PgDn : チャット履歴のスクロール\n")
 		sb.WriteString("  • Ctrl+C      : 生成中断または終了")
@@ -570,31 +596,45 @@ func (a *App) executeSlashCommand(raw string) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleModelCommand(arg string) (tea.Model, tea.Cmd) {
-	lowerArg := strings.ToLower(strings.TrimSpace(arg))
+	trimmedArg := strings.TrimSpace(arg)
+	fields := strings.Fields(trimmedArg)
+	subCmd := ""
+	if len(fields) > 0 {
+		subCmd = strings.ToLower(fields[0])
+	}
 
-	switch lowerArg {
+	switch subCmd {
 	case "":
-		// Open the interactive model selector modal
-		a.openModelModal()
-		return a, nil
+		return a, a.openModelModalCmd()
 
 	case "list", "ls":
 		a.appendMessage(RoleSystem, "Models", a.formatModelList())
+		if !a.agent.IsModelGardenSynced() && !a.refreshingModels {
+			a.refreshingModels = true
+			return a, a.refreshModelGardenCmd(agent.ModelGardenListOptions{IncludeAll: a.includeAllGarden}, false)
+		}
 		return a, nil
 
 	case "current", "info":
 		info := a.agent.CurrentModelInfo()
 		text := fmt.Sprintf(
-			"現在のモデル (Current Vertex AI Model):\n"+
+			"現在のモデル (Current Vertex AI / Model Garden Model):\n"+
 				"  • ID            : %s\n"+
+				"  • Resource Name : %s\n"+
 				"  • Display Name  : %s\n"+
-				"  • Provider      : %s\n"+
+				"  • Publisher     : %s (%s)\n"+
+				"  • Launch Stage  : %s\n"+
+				"  • Source        : %s\n"+
 				"  • Description   : %s\n"+
 				"  • Context       : %s (Max Output: %s)\n"+
 				"  • Aliases       : %s",
 			info.ID,
+			emptyFallback(info.ResourceName, "publishers/google/models/"+info.ID),
 			info.DisplayName,
+			emptyFallback(info.Publisher, "google"),
 			info.Provider,
+			emptyFallback(info.LaunchStage, "GA"),
+			emptyFallback(info.Source, config.SourceModelGarden),
 			info.Description,
 			info.ContextWindow,
 			info.MaxOutput,
@@ -605,20 +645,51 @@ func (a *App) handleModelCommand(arg string) (tea.Model, tea.Cmd) {
 
 	case "refresh", "sync":
 		a.refreshingModels = true
-		a.appendMessage(RoleSystem, "Model Refresh", "Vertex AI からモデル一覧を取得しています...")
-		return a, a.refreshModelsCmd()
+		a.appendMessage(RoleSystem, "Model Garden", "Vertex AI Model Garden (`publishers/*/models`) から利用可能なモデル一覧を取得しています...")
+		return a, a.refreshModelGardenCmd(agent.ModelGardenListOptions{IncludeAll: a.includeAllGarden}, false)
+
+	case "garden":
+		opts := agent.ModelGardenListOptions{
+			IncludeAll: a.includeAllGarden,
+		}
+		if len(fields) > 1 {
+			pubArg := strings.ToLower(fields[1])
+			if pubArg == "all" || pubArg == "--all" {
+				opts.IncludeAll = true
+				a.includeAllGarden = true
+			} else {
+				opts.Publishers = strings.Split(pubArg, ",")
+				// Also pre-filter the modal to this publisher if modal is opened
+			}
+		}
+		a.refreshingModels = true
+		pubLabel := strings.Join(config.DefaultModelGardenPublishers, ", ")
+		if len(opts.Publishers) > 0 {
+			pubLabel = strings.Join(opts.Publishers, ", ")
+		}
+		a.appendMessage(
+			RoleSystem,
+			"Model Garden",
+			fmt.Sprintf("Vertex AI Model Garden (publishers: %s) からモデル一覧を取得しています...", pubLabel),
+		)
+		return a, a.refreshModelGardenCmd(opts, false)
 
 	default:
-		resolved := ResolveModelArg(arg, a.agent.AvailableModels())
+		resolved := ResolveModelArg(trimmedArg, a.agent.AvailableModels())
 		a.switchModel(resolved)
 		return a, nil
 	}
 }
 
-func (a *App) openModelModal() {
+func (a *App) openModelModalCmd() tea.Cmd {
 	a.showModelModal = true
 	a.modelFilterRunes = nil
 	a.syncSelectedModelIndex()
+	if !a.agent.IsModelGardenSynced() && !a.refreshingModels {
+		a.refreshingModels = true
+		return a.refreshModelGardenCmd(agent.ModelGardenListOptions{IncludeAll: a.includeAllGarden}, true)
+	}
+	return nil
 }
 
 func (a *App) syncSelectedModelIndex() {
@@ -654,7 +725,9 @@ func (a *App) switchModel(targetModelID string) {
 
 	var note string
 	if !known {
-		note = "\n  ※ カスタム Vertex AI モデルIDとして設定しました。"
+		note = fmt.Sprintf("\n  • Resource: %s (カスタム Model Garden / Endpoint モデル)", info.ResourceName)
+	} else if info.ResourceName != "" {
+		note = fmt.Sprintf("\n  • Model Garden Resource: %s", info.ResourceName)
 	}
 	a.appendMessage(
 		RoleSystem,
@@ -674,7 +747,11 @@ func (a *App) formatModelList() string {
 	models := a.agent.AvailableModels()
 	current := a.agent.GetModel()
 	var sb strings.Builder
-	sb.WriteString("利用可能な Vertex AI (Agent Platform) モデル一覧:\n")
+	sourceStatus := "オフラインプリセット (`/model garden` で Vertex AI Model Garden API から取得可能)"
+	if a.agent.IsModelGardenSynced() {
+		sourceStatus = "Vertex AI Model Garden API 同期済み"
+	}
+	fmt.Fprintf(&sb, "利用可能な Vertex AI / Model Garden モデル一覧 [%s]:\n", sourceStatus)
 	for i, m := range models {
 		marker := "  "
 		activeSuffix := ""
@@ -682,14 +759,18 @@ func (a *App) formatModelList() string {
 			marker = "● "
 			activeSuffix = " [現在のモデル / current]"
 		}
+		stageBadge := ""
+		if m.LaunchStage != "" {
+			stageBadge = fmt.Sprintf(" [%s]", m.LaunchStage)
+		}
 		aliasText := ""
 		if len(m.Aliases) > 0 {
 			aliasText = fmt.Sprintf(" (aliases: %s)", strings.Join(m.Aliases, ", "))
 		}
-		fmt.Fprintf(&sb, "%s%d. %-24s - %s%s%s\n     %s\n",
-			marker, i+1, m.ID, m.DisplayName, aliasText, activeSuffix, m.Description)
+		fmt.Fprintf(&sb, "%s%2d. %-38s - %s%s%s%s\n      %s | %s\n",
+			marker, i+1, m.ID, m.DisplayName, stageBadge, aliasText, activeSuffix, m.Provider, m.Description)
 	}
-	sb.WriteString("\n使い方: `/model` で対話選択、または `/model <モデルID|番号|エイリアス>` (例: `/model gemini-2.5-flash` または `/model 2`)")
+	sb.WriteString("\n使い方: `/model` で対話選択、`/model <モデルID|番号|エイリアス>` で直接変更、`/model garden [publisher]` で Model Garden から再取得")
 	return sb.String()
 }
 
@@ -720,12 +801,12 @@ func waitForNextStreamMsg(ch <-chan tea.Msg) tea.Cmd {
 	}
 }
 
-func (a *App) refreshModelsCmd() tea.Cmd {
+func (a *App) refreshModelGardenCmd(opts agent.ModelGardenListOptions, silent bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
 		defer cancel()
-		models, err := a.agent.RefreshModels(ctx)
-		return modelsRefreshedMsg{models: models, err: err}
+		models, err := a.agent.RefreshModelGarden(ctx, opts)
+		return modelsRefreshedMsg{models: models, err: err, silent: silent}
 	}
 }
 
@@ -790,7 +871,6 @@ func (a *App) recalculateLayout() {
 		h = 12
 	}
 	a.viewport.Width = w
-	// Reserve rows for header (2), input box + suggestions (4-5), and footer (1)
 	vpHeight := h - 7
 	if vpHeight < 4 {
 		vpHeight = 4
@@ -801,10 +881,6 @@ func (a *App) recalculateLayout() {
 
 func (a *App) refreshViewportContent(scrollToBottom bool) {
 	var sb strings.Builder
-	wrapWidth := a.viewport.Width - 4
-	if wrapWidth < 30 {
-		wrapWidth = 30
-	}
 
 	for i, m := range a.messages {
 		if i > 0 {
@@ -879,7 +955,11 @@ func (a *App) renderHeader() string {
 	projLoc := fmt.Sprintf("GCP: %s/%s", emptyFallback(cfg.Project, "unset"), cfg.Location)
 	var statusBadge string
 	if a.agent.IsConnected() {
-		statusBadge = a.styles.StatusConnected.Render("● Vertex AI")
+		if a.agent.IsModelGardenSynced() {
+			statusBadge = a.styles.StatusConnected.Render("● Vertex AI (Model Garden)")
+		} else {
+			statusBadge = a.styles.StatusConnected.Render("● Vertex AI")
+		}
 	} else {
 		statusBadge = a.styles.StatusWarn.Render("○ Setup Needed")
 	}
@@ -891,7 +971,6 @@ func (a *App) renderHeader() string {
 func (a *App) renderInputArea() string {
 	var sections []string
 
-	// Render live slash-command or `/model` autocomplete bar when input starts with "/"
 	inputStr := string(a.inputRunes)
 	suggestions := SuggestInput(inputStr, a.agent.AvailableModels())
 	if len(suggestions) > 0 {
@@ -912,7 +991,6 @@ func (a *App) renderInputArea() string {
 		sections = append(sections, a.styles.SuggestionBar.Width(a.width).Render(hint))
 	}
 
-	// Render prompt input with cursor
 	left := string(a.inputRunes[:a.cursorPos])
 	cursorChar := "█"
 	right := ""
@@ -922,7 +1000,7 @@ func (a *App) renderInputArea() string {
 
 	var promptLine string
 	if len(a.inputRunes) == 0 {
-		placeholder := a.styles.DimStyle.Render("メッセージを入力、または /model でモデル変更 (/help でコマンド一覧)...")
+		placeholder := a.styles.DimStyle.Render("メッセージを入力、または /model で Model Garden からモデル変更 (/help で一覧)...")
 		promptLine = fmt.Sprintf("❯ %s%s", cursorChar, placeholder)
 	} else {
 		promptLine = fmt.Sprintf("❯ %s%s%s", left, cursorChar, right)
@@ -942,26 +1020,52 @@ func (a *App) renderModelModal() string {
 	filtered := a.filteredModalModels()
 
 	var sb strings.Builder
-	sb.WriteString(a.styles.ModalTitle.Render("✦ Vertex AI (Agent Platform) モデル選択 (/model)") + "\n")
-	sb.WriteString(a.styles.DimStyle.Render("↑/↓: 選択移動 | Enter: モデル変更 | Esc: キャンセル | Ctrl+R: Vertex AIから最新一覧を取得") + "\n\n")
+	gardenBadge := a.styles.StatusWarn.Render("[Fallback Catalog - Ctrl+R で Model Garden から取得]")
+	if a.agent.IsModelGardenSynced() {
+		gardenBadge = a.styles.StatusConnected.Render(fmt.Sprintf("[● Model Garden API 同期済 (%d models)]", len(a.agent.AvailableModels())))
+	}
+	sb.WriteString(a.styles.ModalTitle.Render("✦ Vertex AI Model Garden モデル選択 (/model)") + "  " + gardenBadge + "\n")
+	sb.WriteString(a.styles.DimStyle.Render("↑/↓: 選択移動 | Enter: 変更 | Esc: 閉じる | Ctrl+R: Model Garden再取得 | Ctrl+A: 全モデル表示切替") + "\n\n")
 
 	filterDisplay := filterText
 	if filterDisplay == "" {
-		filterDisplay = a.styles.DimStyle.Render("モデル名で絞り込み、またはカスタムモデルIDを直接入力...")
+		filterDisplay = a.styles.DimStyle.Render("モデル名・パブリッシャー (google, anthropic, meta, mistralai, deepseek-ai) で検索、または直接入力...")
 	} else {
 		filterDisplay = a.styles.HighlightStyle.Render(filterText) + "█"
 	}
-	sb.WriteString(fmt.Sprintf("🔍 検索 / カスタムID: %s\n\n", filterDisplay))
+	sb.WriteString(fmt.Sprintf("🔍 検索 / Model Garden ID: %s\n\n", filterDisplay))
 
 	if a.refreshingModels {
-		sb.WriteString("  " + a.spinner.View() + " Vertex AI から利用可能なモデルを取得中...\n\n")
+		sb.WriteString("  " + a.spinner.View() + " Vertex AI Model Garden (`publishers/*/models`) からモデル一覧を取得中...\n\n")
 	}
 
 	if len(filtered) == 0 {
-		sb.WriteString(a.styles.ModalItemSelected.Render(fmt.Sprintf("❯ カスタム Vertex AI モデルを使用: %q", strings.TrimSpace(filterText))) + "\n")
-		sb.WriteString(a.styles.ModalDesc.Render("Enter キーを押すとこのカスタムモデルIDに切り替えます。") + "\n")
+		sb.WriteString(a.styles.ModalItemSelected.Render(fmt.Sprintf("❯ カスタム Vertex AI / Model Garden モデルを使用: %q", strings.TrimSpace(filterText))) + "\n")
+		sb.WriteString(a.styles.ModalDesc.Render("Enter キーを押すとこのモデルIDに切り替えます (例: publishers/<publisher>/models/<model>)。") + "\n")
 	} else {
-		for i, m := range filtered {
+		// Show a scrollable window around selectedModelIdx so large Model Garden lists fit cleanly on screen
+		maxVisible := 8
+		if a.height > 26 {
+			maxVisible = (a.height - 14) / 2
+			if maxVisible < 5 {
+				maxVisible = 5
+			}
+		}
+		startIdx := 0
+		if a.selectedModelIdx >= maxVisible {
+			startIdx = a.selectedModelIdx - maxVisible + 1
+		}
+		endIdx := startIdx + maxVisible
+		if endIdx > len(filtered) {
+			endIdx = len(filtered)
+		}
+
+		if startIdx > 0 {
+			sb.WriteString(a.styles.DimStyle.Render(fmt.Sprintf("  ▲ 他 %d 件のモデル (↑ キーでスクロール)\n", startIdx)))
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			m := filtered[i]
 			isSelected := i == a.selectedModelIdx
 			isCurrent := strings.EqualFold(m.ID, currentModelID)
 
@@ -970,7 +1074,7 @@ func (a *App) renderModelModal() string {
 				prefix = "❯ "
 			}
 
-			line := fmt.Sprintf("%s%-24s (%s)", prefix, m.ID, m.DisplayName)
+			line := fmt.Sprintf("%s%-34s (%s)", prefix, m.ID, m.DisplayName)
 			if isSelected {
 				line = a.styles.ModalItemSelected.Render(line)
 			} else {
@@ -978,18 +1082,30 @@ func (a *App) renderModelModal() string {
 			}
 
 			if isCurrent {
-				line += " " + a.styles.ModalActiveBadge.Render("[● 現在のモデル / Active]")
+				line += " " + a.styles.ModalActiveBadge.Render("[● Active]")
 			}
 			if m.Recommended {
 				line += " " + a.styles.HighlightStyle.Render("[推奨]")
+			}
+			if m.LaunchStage != "" {
+				line += " " + a.styles.DimStyle.Render("["+m.LaunchStage+"]")
+			}
+			if m.Source == config.SourceModelGarden {
+				line += " " + a.styles.HeaderBadge.Render("[Model Garden]")
+			} else if m.Source == config.SourceVertexTuned {
+				line += " " + a.styles.HeaderBadge.Render("[Tuned]")
 			}
 			if m.SupportsThinking {
 				line += " " + a.styles.DimStyle.Render("[Thinking]")
 			}
 
 			sb.WriteString(line + "\n")
-			descLine := fmt.Sprintf("%s | Context: %s", m.Description, m.ContextWindow)
+			descLine := fmt.Sprintf("[%s] %s | Context: %s", emptyFallback(m.Publisher, "google"), m.Description, m.ContextWindow)
 			sb.WriteString(a.styles.ModalDesc.Render(descLine) + "\n")
+		}
+
+		if endIdx < len(filtered) {
+			sb.WriteString(a.styles.DimStyle.Render(fmt.Sprintf("  ▼ 他 %d 件のモデル (↓ キーでスクロール)\n", len(filtered)-endIdx)))
 		}
 	}
 
@@ -1006,11 +1122,11 @@ func (a *App) renderFooter() string {
 	if a.lastTokensIn > 0 || a.lastTokensOut > 0 {
 		tokenInfo = fmt.Sprintf(" | Tokens: in=%d out=%d", a.lastTokensIn, a.lastTokensOut)
 	}
-	help := fmt.Sprintf("/model: モデル変更 (現在: %s) | Ctrl+O: モデル選択 | /tools: ツール一覧 | /help: ヘルプ | Ctrl+C: 終了%s", modelID, tokenInfo)
+	help := fmt.Sprintf("/model: モデル変更 (現在: %s) | /model garden: Model Garden取得 | Ctrl+O: 選択画面 | /help | Ctrl+C: 終了%s", modelID, tokenInfo)
 	return a.styles.FooterBar.Width(a.width).Render(help)
 }
 
-// GetActiveModel returns the currently selected Vertex AI model ID (useful for tests and inspection).
+// GetActiveModel returns the currently selected Vertex AI model ID.
 func (a *App) GetActiveModel() string {
 	return a.agent.GetModel()
 }

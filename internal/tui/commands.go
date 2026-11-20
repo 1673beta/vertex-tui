@@ -20,8 +20,8 @@ func SlashCommands() []SlashCommandSpec {
 	return []SlashCommandSpec{
 		{
 			Command:     "/model",
-			Usage:       "/model [model-id | list | current | refresh]",
-			Description: "使用するVertex AIモデルを変更・一覧表示します (Interactive model picker or direct switch)",
+			Usage:       "/model [model-id | list | current | refresh | garden [publisher]]",
+			Description: "Vertex AI / Model Garden のモデル変更・一覧取得を行います",
 		},
 		{
 			Command:     "/project",
@@ -41,7 +41,7 @@ func SlashCommands() []SlashCommandSpec {
 		{
 			Command:     "/status",
 			Usage:       "/status",
-			Description: "現在のVertex AI接続状態・モデル・ワークスペース情報を表示します",
+			Description: "現在のVertex AI接続状態・Model Garden同期状態・モデル情報を表示します",
 		},
 		{
 			Command:     "/clear",
@@ -70,6 +70,24 @@ func SuggestInput(input string, models []config.ModelInfo) []string {
 
 	lower := strings.ToLower(trimmedLeft)
 
+	// If user is typing "/model garden <publisher>", suggest Model Garden publishers
+	if strings.HasPrefix(lower, "/model garden ") || strings.HasPrefix(lower, "/models garden ") {
+		parts := strings.Fields(trimmedLeft)
+		cmdPrefix := parts[0] + " garden"
+		pubPrefix := ""
+		if len(parts) >= 3 {
+			pubPrefix = strings.ToLower(parts[2])
+		}
+		candidates := append([]string{"all"}, config.DefaultModelGardenPublishers...)
+		var out []string
+		for _, pub := range candidates {
+			if pubPrefix == "" || strings.HasPrefix(pub, pubPrefix) {
+				out = append(out, fmt.Sprintf("%s %s", cmdPrefix, pub))
+			}
+		}
+		return out
+	}
+
 	// If user is typing "/model <prefix>" or "/models <prefix>", suggest matching model IDs
 	if strings.HasPrefix(lower, "/model ") || strings.HasPrefix(lower, "/models ") {
 		parts := strings.SplitN(trimmedLeft, " ", 2)
@@ -90,7 +108,7 @@ func SuggestInput(input string, models []config.ModelInfo) []string {
 				}
 			}
 		}
-		for _, sub := range []string{"list", "current", "refresh"} {
+		for _, sub := range []string{"list", "current", "refresh", "garden"} {
 			if argPrefix != "" && strings.HasPrefix(sub, argPrefix) {
 				out = append(out, fmt.Sprintf("%s %s", cmdPrefix, sub))
 			}
@@ -110,8 +128,8 @@ func SuggestInput(input string, models []config.ModelInfo) []string {
 
 // ResolveModelArg resolves a `/model <arg>` argument, supporting:
 // - 1-based numeric index (e.g. `/model 1`, `/model 2`)
-// - preset ID or alias (e.g. `gemini-2.5-flash`, `flash`, `pro`)
-// - arbitrary custom Vertex AI model ID
+// - preset/Model Garden ID or alias (e.g. `gemini-2.5-flash`, `flash`, `pro`, `claude`, `llama`)
+// - arbitrary custom Vertex AI / Model Garden model ID (e.g. `publishers/anthropic/models/claude-3-7-sonnet@20250219`)
 func ResolveModelArg(arg string, models []config.ModelInfo) string {
 	trimmed := strings.TrimSpace(arg)
 	if trimmed == "" {

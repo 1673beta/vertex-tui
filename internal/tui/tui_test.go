@@ -86,8 +86,8 @@ func TestSlashModelInteractiveModalSelection(t *testing.T) {
 	}
 
 	view := app.View()
-	if !strings.Contains(view, "モデル選択 (/model)") || !strings.Contains(view, "gemini-2.5-flash") {
-		t.Fatalf("expected modal view to display available Vertex AI models, got:\n%s", view)
+	if !strings.Contains(view, "Vertex AI Model Garden モデル選択 (/model)") || !strings.Contains(view, "gemini-2.5-flash") {
+		t.Fatalf("expected modal view to display available Vertex AI Model Garden models, got:\n%s", view)
 	}
 
 	// 2. Press Down arrow to select "gemini-2.5-flash" and press Enter

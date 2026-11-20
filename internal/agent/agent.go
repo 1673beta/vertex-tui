@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -38,21 +39,35 @@ type StreamEvent struct {
 	OutputTokens int32
 }
 
-// Backend abstracts the Google GenAI SDK Vertex AI operations so the agent and TUI
-// can operate against live Google Cloud Vertex AI or deterministic test doubles.
+// Backend abstracts the Google GenAI SDK and Vertex AI Model Garden operations so the agent
+// and TUI can operate against live Google Cloud Vertex AI or deterministic test doubles.
 type Backend interface {
 	GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error]
 	ListModels(ctx context.Context) ([]config.ModelInfo, error)
 }
 
-// VertexBackend implements Backend using the official Google GenAI SDK (google.golang.org/genai)
-// configured with BackendVertexAI.
-type VertexBackend struct {
-	client *genai.Client
+// ModelGardenBackend is an optional extension implemented by VertexBackend to support
+// filtering by Model Garden publisher or including non-LLM Model Garden models.
+type ModelGardenBackend interface {
+	Backend
+	FetchModelGardenModels(ctx context.Context, opts ModelGardenListOptions) ([]config.ModelInfo, error)
 }
 
-// NewVertexBackend creates a Google GenAI SDK client targeting Google Cloud Vertex AI (Agent Platform).
+// VertexBackend implements Backend and ModelGardenBackend using the official Google GenAI SDK
+// (google.golang.org/genai) configured with BackendVertexAI, plus the Vertex AI Model Garden API.
+type VertexBackend struct {
+	client     *genai.Client
+	httpClient *http.Client
+	baseURL    string
+	apiVersion string
+	apiKey     string
+}
+
+// NewVertexBackend creates a Google GenAI SDK client targeting Google Cloud Vertex AI (Agent Platform)
+// along with an authenticated HTTP client for querying the Vertex AI Model Garden API.
 func NewVertexBackend(ctx context.Context, cfg *config.Config) (*VertexBackend, error) {
+	httpClient, baseURL, httpErr := buildVertexHTTPClient(ctx, cfg)
+
 	cc := &genai.ClientConfig{
 		Backend:  genai.BackendVertexAI,
 		Project:  cfg.Project,
@@ -61,11 +76,46 @@ func NewVertexBackend(ctx context.Context, cfg *config.Config) (*VertexBackend, 
 	if cfg.APIKey != "" && cfg.Project == "" {
 		cc.APIKey = cfg.APIKey
 	}
+	if httpClient != nil && cfg.APIKey == "" {
+		cc.HTTPClient = httpClient
+	}
+
 	client, err := genai.NewClient(ctx, cc)
 	if err != nil {
+		// Even if genai.NewClient fails (for example, GOOGLE_CLOUD_PROJECT is not set yet),
+		// if we have ADC credentials (httpClient != nil), we can still return a partial
+		// VertexBackend capable of querying the global Model Garden publisher catalog!
+		if httpClient != nil && httpErr == nil {
+			return &VertexBackend{
+				client:     nil,
+				httpClient: httpClient,
+				baseURL:    baseURL,
+				apiVersion: "v1beta1",
+				apiKey:     cfg.APIKey,
+			}, err
+		}
 		return nil, err
 	}
-	return &VertexBackend{client: client}, nil
+
+	resolvedCfg := client.ClientConfig()
+	if resolvedCfg.HTTPOptions.BaseURL != "" {
+		baseURL = resolvedCfg.HTTPOptions.BaseURL
+	}
+	apiVer := resolvedCfg.HTTPOptions.APIVersion
+	if apiVer == "" {
+		apiVer = "v1beta1"
+	}
+	if httpClient == nil {
+		httpClient = resolvedCfg.HTTPClient
+	}
+
+	return &VertexBackend{
+		client:     client,
+		httpClient: httpClient,
+		baseURL:    baseURL,
+		apiVersion: apiVer,
+		apiKey:     resolvedCfg.APIKey,
+	}, nil
 }
 
 // Client returns the underlying genai.Client.
@@ -75,74 +125,38 @@ func (v *VertexBackend) Client() *genai.Client {
 
 // GenerateContentStream delegates to client.Models.GenerateContentStream.
 func (v *VertexBackend) GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
+	if v.client == nil {
+		return func(yield func(*genai.GenerateContentResponse, error) bool) {
+			yield(nil, fmt.Errorf("Vertex AI GenAI client is not initialized (check GOOGLE_CLOUD_PROJECT / /project)"))
+		}
+	}
 	return v.client.Models.GenerateContentStream(ctx, model, contents, cfg)
 }
 
-// ListModels queries Vertex AI for available models via client.Models.All.
+// ListModels queries Vertex AI Model Garden for available models.
 func (v *VertexBackend) ListModels(ctx context.Context) ([]config.ModelInfo, error) {
-	var discovered []config.ModelInfo
-	for m, err := range v.client.Models.All(ctx) {
-		if err != nil {
-			if len(discovered) > 0 {
-				break
-			}
-			return nil, err
-		}
-		if m == nil || m.Name == "" {
-			continue
-		}
-		id := config.NormalizeModelID(m.Name, config.DefaultModels())
-		displayName := m.DisplayName
-		if displayName == "" {
-			displayName = id
-		}
-		desc := m.Description
-		if desc == "" {
-			desc = fmt.Sprintf("Vertex AI model (%s)", m.Name)
-		}
-		ctxWindow := "Vertex AI"
-		if m.InputTokenLimit > 0 {
-			ctxWindow = fmt.Sprintf("%d tokens", m.InputTokenLimit)
-		}
-		maxOut := "Vertex AI"
-		if m.OutputTokenLimit > 0 {
-			maxOut = fmt.Sprintf("%d tokens", m.OutputTokenLimit)
-		}
-		discovered = append(discovered, config.ModelInfo{
-			ID:               id,
-			DisplayName:      displayName,
-			Provider:         "Google / Vertex AI",
-			Description:      desc,
-			ContextWindow:    ctxWindow,
-			MaxOutput:        maxOut,
-			SupportsThinking: m.Thinking,
-			SupportsTools:    true,
-		})
-	}
-	return discovered, nil
+	return v.FetchModelGardenModels(ctx, ModelGardenListOptions{})
 }
 
-// Agent coordinates the Vertex AI model, conversation history, and coding tools.
+// Agent coordinates the Vertex AI model, Model Garden catalog, conversation history, and coding tools.
 type Agent struct {
-	mu          sync.RWMutex
-	cfg         *config.Config
-	models      []config.ModelInfo
-	history     []*genai.Content
-	toolExec    *tools.Executor
-	backend     Backend
-	initErr     error
-	maxToolTurn int
+	mu                sync.RWMutex
+	cfg               *config.Config
+	models            []config.ModelInfo
+	modelGardenSynced bool
+	history           []*genai.Content
+	toolExec          *tools.Executor
+	backend           Backend
+	initErr           error
+	maxToolTurn       int
 }
 
 // New creates a new coding Agent for Vertex AI.
-// If backend is nil, it attempts to initialize a live VertexBackend via google.golang.org/genai.
-// Even if live client initialization fails (e.g. GOOGLE_CLOUD_PROJECT not set yet),
-// the Agent is still returned so the TUI can launch and allow `/model`, `/project`, `/location`, etc.
 func New(ctx context.Context, cfg *config.Config, backend Backend) *Agent {
 	if cfg == nil {
 		cfg = config.DefaultConfig()
 	}
-	catalog := config.DefaultModels()
+	catalog := config.FallbackModels()
 	cfg.Model = config.NormalizeModelID(cfg.Model, catalog)
 	if cfg.Model == "" {
 		cfg.Model = config.DefaultModelID
@@ -153,7 +167,8 @@ func New(ctx context.Context, cfg *config.Config, backend Backend) *Agent {
 		vb, err := NewVertexBackend(ctx, cfg)
 		if err != nil {
 			initErr = err
-		} else {
+		}
+		if vb != nil {
 			backend = vb
 		}
 	}
@@ -175,13 +190,11 @@ func (a *Agent) Reconnect(ctx context.Context) error {
 	defer a.mu.Unlock()
 
 	vb, err := NewVertexBackend(ctx, a.cfg)
-	if err != nil {
-		a.initErr = err
-		return err
+	if vb != nil {
+		a.backend = vb
 	}
-	a.backend = vb
-	a.initErr = nil
-	return nil
+	a.initErr = err
+	return err
 }
 
 // ConnectionError returns any client initialization error.
@@ -191,11 +204,24 @@ func (a *Agent) ConnectionError() error {
 	return a.initErr
 }
 
-// IsConnected reports whether a GenAI backend is ready.
+// IsConnected reports whether a GenAI backend is ready for chat generation.
 func (a *Agent) IsConnected() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.backend != nil
+	if a.backend == nil {
+		return false
+	}
+	if vb, ok := a.backend.(*VertexBackend); ok {
+		return vb.client != nil && a.initErr == nil
+	}
+	return a.initErr == nil
+}
+
+// IsModelGardenSynced reports whether the model catalog has been dynamically fetched from Vertex AI Model Garden.
+func (a *Agent) IsModelGardenSynced() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.modelGardenSynced
 }
 
 // Config returns a copy of the current configuration.
@@ -221,9 +247,6 @@ func (a *Agent) CurrentModelInfo() config.ModelInfo {
 }
 
 // SetModel changes the active Vertex AI model used by the coding agent.
-// It normalizes aliases (e.g. "pro" -> "gemini-2.5-pro", "flash" -> "gemini-2.5-flash")
-// while also allowing any custom Vertex AI or Model Garden model ID.
-// It returns the previous model ID, the new resolved ModelInfo, and whether it matched a preset in the catalog.
 func (a *Agent) SetModel(modelID string) (string, config.ModelInfo, bool, error) {
 	trimmed := strings.TrimSpace(modelID)
 	if trimmed == "" {
@@ -238,7 +261,6 @@ func (a *Agent) SetModel(modelID string) (string, config.ModelInfo, bool, error)
 	info, known := config.FindModel(canonical, a.models)
 	a.cfg.Model = info.ID
 
-	// If it's a custom model not yet in the session catalog, add it so it appears in `/model` picker
 	if !known {
 		a.models = config.MergeModels(a.models, []config.ModelInfo{info})
 	}
@@ -256,28 +278,46 @@ func (a *Agent) AvailableModels() []config.ModelInfo {
 	return out
 }
 
-// RefreshModels queries Vertex AI for models and merges them into the available catalog.
+// RefreshModels queries Vertex AI Model Garden for available models using default options.
 func (a *Agent) RefreshModels(ctx context.Context) ([]config.ModelInfo, error) {
+	return a.RefreshModelGarden(ctx, ModelGardenListOptions{})
+}
+
+// RefreshModelGarden queries Vertex AI Model Garden (publishers/*/models and project-tuned models)
+// and updates the agent's model catalog.
+func (a *Agent) RefreshModelGarden(ctx context.Context, opts ModelGardenListOptions) ([]config.ModelInfo, error) {
 	a.mu.RLock()
 	b := a.backend
 	a.mu.RUnlock()
 
 	if b == nil {
-		if err := a.Reconnect(ctx); err != nil {
-			return a.AvailableModels(), err
-		}
+		_ = a.Reconnect(ctx)
 		a.mu.RLock()
 		b = a.backend
 		a.mu.RUnlock()
+		if b == nil {
+			return a.AvailableModels(), fmt.Errorf("Vertex AI バックエンドが未初期化です: %v", a.ConnectionError())
+		}
 	}
 
-	discovered, err := b.ListModels(ctx)
+	var (
+		discovered []config.ModelInfo
+		err        error
+	)
+	if mgb, ok := b.(ModelGardenBackend); ok {
+		discovered, err = mgb.FetchModelGardenModels(ctx, opts)
+	} else {
+		discovered, err = b.ListModels(ctx)
+	}
 	if err != nil {
 		return a.AvailableModels(), err
 	}
 
 	a.mu.Lock()
 	a.models = config.MergeModels(a.models, discovered)
+	if len(discovered) > 0 {
+		a.modelGardenSynced = true
+	}
 	out := make([]config.ModelInfo, len(a.models))
 	copy(out, a.models)
 	a.mu.Unlock()
@@ -353,18 +393,15 @@ func (a *Agent) systemInstruction() *genai.Content {
 // RunTurn sends userPrompt to the active Vertex AI model, streams responses via onEvent,
 // and automatically executes any requested coding tool calls in an agentic loop.
 func (a *Agent) RunTurn(ctx context.Context, userPrompt string, onEvent func(StreamEvent)) error {
-	a.mu.RLock()
-	b := a.backend
-	a.mu.RUnlock()
-
-	if b == nil {
+	if !a.IsConnected() {
 		if err := a.Reconnect(ctx); err != nil {
 			return fmt.Errorf("Vertex AI クライアントが未接続です (GOOGLE_CLOUD_PROJECT または /project を設定してください): %w", err)
 		}
-		a.mu.RLock()
-		b = a.backend
-		a.mu.RUnlock()
 	}
+
+	a.mu.RLock()
+	b := a.backend
+	a.mu.RUnlock()
 
 	userContent := genai.NewContentFromText(userPrompt, genai.RoleUser)
 	a.mu.Lock()
@@ -472,7 +509,6 @@ func (a *Agent) RunTurn(ctx context.Context, userPrompt string, onEvent func(Str
 			return nil
 		}
 
-		// Execute requested function calls and send FunctionResponses back to the model
 		var responseParts []*genai.Part
 		for _, fc := range functionCalls {
 			argsJSON, _ := json.Marshal(fc.Args)
@@ -515,8 +551,6 @@ func (a *Agent) RunTurn(ctx context.Context, userPrompt string, onEvent func(Str
 	return fmt.Errorf("maximum tool execution turns (%d) reached", a.maxToolTurn)
 }
 
-// mergeStreamParts coalesces adjacent text parts from streaming chunks while keeping
-// function calls and thought flags intact for clean conversation history.
 func mergeStreamParts(parts []*genai.Part) []*genai.Part {
 	if len(parts) == 0 {
 		return nil

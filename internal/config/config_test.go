@@ -77,17 +77,26 @@ func TestFilterModels(t *testing.T) {
 func TestMergeModels(t *testing.T) {
 	base := DefaultModels()
 	discovered := []ModelInfo{
-		{ID: "publishers/google/models/gemini-2.5-pro"},
-		{ID: " publishers/google/models/gemini-exp-1206 ", DisplayName: "Gemini Exp 1206"},
+		{ID: "publishers/google/models/gemini-2.5-pro", Source: SourceModelGarden, LaunchStage: "GA"},
+		{ID: " publishers/google/models/gemini-exp-1206 ", DisplayName: "Gemini Exp 1206", Source: SourceModelGarden},
+		{ID: "publishers/anthropic/models/claude-3-7-sonnet@20250219", Source: SourceModelGarden},
 	}
 
 	merged := MergeModels(base, discovered)
 	if len(merged) != len(base)+1 {
 		t.Fatalf("expected %d merged models, got %d", len(base)+1, len(merged))
 	}
-	last := merged[len(merged)-1]
-	if last.ID != "gemini-exp-1206" {
-		t.Fatalf("expected last model ID 'gemini-exp-1206', got %q", last.ID)
+	foundExp := false
+	for _, m := range merged {
+		if m.ID == "gemini-exp-1206" {
+			foundExp = true
+		}
+		if m.ID == "gemini-2.5-pro" && m.Source != SourceModelGarden {
+			t.Fatalf("expected gemini-2.5-pro source to be updated to %q, got %q", SourceModelGarden, m.Source)
+		}
+	}
+	if !foundExp {
+		t.Fatalf("expected merged models to include 'gemini-exp-1206'")
 	}
 }
 
